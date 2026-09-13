@@ -33,6 +33,15 @@ jobs:
         uses: actions/checkout@v4
       - name: Setup Pages
         uses: actions/configure-pages@v5
+      - name: Write Supabase runtime configuration
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        shell: bash
+        run: |
+          printf 'window.FOODBRIDGE_CONFIG = {supabaseUrl: %s, supabaseAnonKey: %s};\n' \
+            "$(jq -Rn --arg value "$SUPABASE_URL" '$value')" \
+            "$(jq -Rn --arg value "$SUPABASE_ANON_KEY" '$value')" > config.js
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

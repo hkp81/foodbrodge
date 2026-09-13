@@ -1,6 +1,71 @@
-const STORAGE_KEY = 'foodbridge-listings-v1';
 const now = Date.now();
 let listings = [], currentType = 'all', map, markersLayer, userMarker, userLocation = null, mapReady = false;
+let backendReady = false, backendError = '';
+const config = window.FOODBRIDGE_CONFIG || {};
+const supabaseClient = config.supabaseUrl && config.supabaseAnonKey && window.supabase
+  ? window.supabase.createClient(config.supabaseUrl, config.supabaseAnonKey)
+  : null;
+
+const backend = {
+  configured: Boolean(supabaseClient),
+  async loadListings() {
+    if (!supabaseClient) throw new Error('Supabase is not configured. Copy config.example.js to config.js or add GitHub Pages secrets.');
+    const { data, error } = await supabaseClient.from('listings').select('*').order('created_at', { ascending: false });
+    if (error) throw error;
+    return data.map(fromDatabaseListing);
+  },
+  async createListing(listing) {
+    if (!supabaseClient) throw new Error('Supabase is not configured.');
+    const { data, error } = await supabaseClient.from('listings').insert(toDatabaseListing(listing)).select().single();
+    if (error) throw error;
+    return fromDatabaseListing(data);
+  },
+  async updateListing(id, changes) {
+    if (!supabaseClient) throw new Error('Supabase is not configured.');
+    const { data, error } = await supabaseClient.from('listings').update(toDatabaseChanges(changes)).eq('id', id).select().single();
+    if (error) throw error;
+    return fromDatabaseListing(data);
+  },
+  async signIn(email, password) {
+    if (!supabaseClient) throw new Error('Supabase is not configured. Authentication is unavailable until setup is complete.');
+    const result = await supabaseClient.auth.signInWithPassword({ email, password });
+    if (result.error) throw result.error;
+    return result.data.user;
+  },
+  async signUp(name, email, password) {
+    if (!supabaseClient) throw new Error('Supabase is not configured. Authentication is unavailable until setup is complete.');
+    const result = await supabaseClient.auth.signUp({ email, password, options: { data: { display_name: name } } });
+    if (result.error) throw result.error;
+    return result.data.user;
+  },
+  async session() {
+    if (!supabaseClient) return null;
+    const { data, error } = await supabaseClient.auth.getSession();
+    if (error) throw error;
+    return data.session;
+  },
+  async signOut() {
+    if (supabaseClient) await supabaseClient.auth.signOut();
+  }
+};
+
+function toDatabaseListing(l) {
+  return { type:l.type, provider_name:l.providerName, provider_type:l.providerType, food_name:l.foodName, description:l.description, food_category:l.foodCategory, vegetarian:l.vegetarian, quantity:l.quantity, meals:l.meals, available_quantity:l.availableQuantity, address:l.address, latitude:l.latitude, longitude:l.longitude, pickup_deadline:new Date(l.pickupDeadline).toISOString(), claim_deadline:new Date(l.claimDeadline).toISOString(), reservation_deadline:new Date(l.reservationDeadline).toISOString(), status:l.status, collection_instructions:l.collectionInstructions, original_price:l.originalPrice || null, discounted_price:l.discountedPrice || null, discount_percentage:l.discountPercentage || 0, reserved_quantity:l.reservedQuantity || 0, owner_id:l.ownerId };
+}
+function fromDatabaseListing(l) {
+  return { id:l.id, type:l.type, providerName:l.provider_name, providerType:l.provider_type, foodName:l.food_name, description:l.description, foodCategory:l.food_category, vegetarian:l.vegetarian, quantity:l.quantity, meals:l.meals, availableQuantity:l.available_quantity, address:l.address, latitude:l.latitude, longitude:l.longitude, createdAt:new Date(l.created_at).getTime(), pickupDeadline:new Date(l.pickup_deadline).getTime(), claimDeadline:l.claim_deadline ? new Date(l.claim_deadline).getTime() : new Date(l.pickup_deadline).getTime(), reservationDeadline:l.reservation_deadline ? new Date(l.reservation_deadline).getTime() : new Date(l.pickup_deadline).getTime(), status:l.status, collectionInstructions:l.collection_instructions, originalPrice:l.original_price, discountedPrice:l.discounted_price, discountPercentage:l.discount_percentage || 0, reservedQuantity:l.reserved_quantity || 0, claimedBy:l.claimed_by, ownerId:l.owner_id };
+}
+function toDatabaseChanges(changes) {
+  const result = {};
+  const keys = { status:'status', claimedBy:'claimed_by', claimedAt:'claimed_at', reservedQuantity:'reserved_quantity', availableQuantity:'available_quantity' };
+  Object.keys(changes).forEach(key => { if (keys[key]) result[keys[key]] = key === 'claimedAt' ? new Date(changes[key]).toISOString() : changes[key]; });
+  return result;
+}
+function setBackendStatus(message, isError = false) {
+  backendError = isError ? message : '';
+  const status = document.getElementById('backendStatus');
+  if (status) { status.textContent = message; status.classList.toggle('backend-error', isError); }
+}
 
 const seedListings = [
   {id:'d1',type:'donation',providerName:'GreenLeaf Hostel Mess',providerType:'Hostel',foodName:'Rice, Dal & Vegetables',description:'Freshly prepared vegetarian lunch, packed for collection.',foodCategory:'Prepared meals',vegetarian:true,quantity:42,meals:42,address:'Lovely Professional University, Phagwara',latitude:31.255,longitude:75.705,createdAt:now-22*60000,pickupDeadline:now+88*60000,claimDeadline:now+88*60000,status:'active',collectionInstructions:'Collect from the mess entrance. Please bring insulated containers.',claimedBy:null},
@@ -11,17 +76,15 @@ const seedListings = [
   {id:'s3',type:'sell',providerName:'Pizza Corner',providerType:'Restaurant',foodName:'Fresh Meal Combo',description:'A meal combo from today’s kitchen run.',foodCategory:'Prepared meals',vegetarian:false,quantity:3,availableQuantity:3,address:'Law Gate, Phagwara',latitude:31.252,longitude:75.698,createdAt:now-9*60000,pickupDeadline:now+155*60000,reservationDeadline:now+155*60000,status:'active',originalPrice:500,discountedPrice:220,discountPercentage:56,reservedQuantity:0}
 ];
 
-function loadListings(){ try { listings = JSON.parse(localStorage.getItem(STORAGE_KEY)) || seedListings; } catch { listings = seedListings; } updateExpiries(); }
-function saveListingsToLocalStorage(){localStorage.setItem(STORAGE_KEY,JSON.stringify(listings));}
+async function loadListings(){ try { listings = await backend.loadListings(); backendReady = true; setBackendStatus('Connected to FoodBridge.'); } catch (error) { listings = seedListings; backendError = error.message; setBackendStatus(`Backend unavailable: ${error.message} Sample listings are read-only.`, true); } updateExpiries(); renderListings(); updateImpact(); }
 function getActiveListings(){return listings.filter(l=>l.status==='active' && deadline(l)>Date.now())}
 function getDonationListings(){return getActiveListings().filter(l=>l.type==='donation')}
 function getSellListings(){return getActiveListings().filter(l=>l.type==='sell')}
 function getListingById(id){return listings.find(l=>l.id===id)}
-function addListing(listing){listings.unshift(listing);saveListingsToLocalStorage()}
-function updateListing(id,changes){const l=getListingById(id);if(l){Object.assign(l,changes);saveListingsToLocalStorage()}}
-function removeListing(id){listings=listings.filter(l=>l.id!==id);saveListingsToLocalStorage()}
+async function addListing(listing){const saved = await backend.createListing(listing);listings.unshift(saved)}
+async function updateListing(id,changes){const l=getListingById(id);if(l){const saved = await backend.updateListing(id,changes);Object.assign(l,saved)}}
 function deadline(l){return l.type==='donation'?l.claimDeadline:l.reservationDeadline}
-function updateExpiries(){let changed=false;listings.forEach(l=>{if(l.status==='active'&&deadline(l)<=Date.now()){l.status='expired';changed=true}});if(changed)saveListingsToLocalStorage()}
+function updateExpiries(){listings.forEach(l=>{if(l.status==='active'&&deadline(l)<=Date.now())l.status='expired'})}
 function distanceKm(lat1,lon1,lat2,lon2){const R=6371,dLat=(lat2-lat1)*Math.PI/180,dLon=(lon2-lon1)*Math.PI/180,a=Math.sin(dLat/2)**2+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a))}
 function distanceText(l){if(!userLocation)return 'Nearby';return `${distanceKm(userLocation.lat,userLocation.lng,l.latitude,l.longitude).toFixed(1)} km away`}
 function timeText(ms){if(ms<=0)return 'Expired';const h=Math.floor(ms/3600000),m=Math.floor(ms%3600000/60000),s=Math.floor(ms%60000/1000);return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`}
@@ -41,11 +104,11 @@ function openDirections(id){const l=getListingById(id);if(!l)return;const start=
 function useLocation(){const status=document.getElementById('locationStatus');if(!navigator.geolocation){status.textContent='Your browser does not support location. You can still search manually.';return}status.textContent='Requesting your location…';navigator.geolocation.getCurrentPosition(pos=>{userLocation={lat:pos.coords.latitude,lng:pos.coords.longitude};status.textContent='Location set. Listings are now sorted by distance when you choose “Nearest first”.';initMap();if(userMarker)map.removeLayer(userMarker);userMarker=L.marker([userLocation.lat,userLocation.lng]).bindPopup('You are here').addTo(map);map.setView([userLocation.lat,userLocation.lng],14);renderListings()},()=>{status.textContent='Location access helps us show food near you. You can still browse listings or search for a location manually.'},{enableHighAccuracy:true,timeout:10000})}
 async function manualSearch(){const place=prompt('Enter a city, locality or address');if(!place)return;const status=document.getElementById('locationStatus');status.textContent='Finding that location…';try{const res=await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(place)}`);const data=await res.json();if(!data.length)throw new Error();userLocation={lat:+data[0].lat,lng:+data[0].lon};status.textContent=`Showing food around ${data[0].display_name.split(',').slice(0,2).join(',')}.`;initMap();map.setView([userLocation.lat,userLocation.lng],13);renderListings()}catch{status.textContent='We couldn’t find that place. Try a city or neighbourhood name.'}}
 function openAction(id){const l=getListingById(id);if(!l||l.status!=='active'){showToast('This listing is no longer available.');return}const isD=l.type==='donation';document.getElementById('modalContent').innerHTML=`<p class="eyebrow">${isD?'CONFIRM COLLECTION':'CONFIRM RESERVATION'}</p><h2>${isD?'Claim this food?':'Reserve this deal?'}</h2><div class="modal-detail"><b>${l.foodName}</b>${l.providerName}<br>${isD?`${l.meals} meals`:`₹${l.discountedPrice} · ${l.availableQuantity} available`} · ${distanceText(l)}<br><small>${l.address}</small></div><p>${isD?'By claiming, you’re confirming you can collect before the safe pickup window closes.':'Reserve now, then collect directly from the provider before the pickup window closes.'}</p><div class="modal-actions"><button class="button ghost" onclick="closeModal()">Not now</button><button class="button" onclick="confirmAction('${l.id}')">${isD?'Claim food':'Reserve deal'} →</button></div>`;document.getElementById('modal').classList.add('open')}
-function confirmAction(id){const l=getListingById(id),isD=l.type==='donation';if(isD)updateListing(id,{status:'claimed',claimedBy:'You',claimedAt:Date.now()});else updateListing(id,{status:'reserved',reservedQuantity:(l.reservedQuantity||0)+1,availableQuantity:l.availableQuantity-1});closeModal();showToast(isD?'Food claimed — collection details are saved.':'Deal reserved — enjoy your pickup!');renderListings()}
+async function confirmAction(id){const l=getListingById(id);if(!l)return;const isD=l.type==='donation';try{const session=await backend.session();if(!session){showView('login');closeModal();showToast('Please log in before claiming or reserving food.');return}await updateListing(id,isD?{status:'claimed',claimedBy:session.user.id,claimedAt:Date.now()}:{status:'reserved',reservedQuantity:(l.reservedQuantity||0)+1,availableQuantity:l.availableQuantity-1});closeModal();showToast(isD?'Food claimed — collection details are saved.':'Deal reserved — enjoy your pickup!');renderListings()}catch(error){setBackendStatus(`Could not save this action: ${error.message}`,true);showToast('We could not save that action. Please try again.')} }
 function closeModal(){document.getElementById('modal').classList.remove('open')}
 function choosePostType(type){document.getElementById('listingType').value=type;document.querySelectorAll('.post-type').forEach(b=>b.classList.toggle('active',b.dataset.posttype===type));togglePostFields()}
 function togglePostFields(){document.getElementById('saleFields').classList.toggle('hidden',document.getElementById('listingType').value!=='sell')}
-function handlePost(e){e.preventDefault();const type=document.getElementById('listingType').value,mins=+document.getElementById('minutes').value,op=+document.getElementById('originalPrice').value,dp=+document.getElementById('discountedPrice').value;if(type==='sell'&&(!op||!dp||dp>=op)){showToast('Please enter a discounted price lower than the original price.');return}const l={id:'custom-'+Date.now(),type,providerName:document.getElementById('providerName').value,providerType:'Community provider',foodName:document.getElementById('foodName').value,description:document.getElementById('notes').value,foodCategory:document.getElementById('category').value,vegetarian:document.getElementById('vegetarian').checked,quantity:+document.getElementById('quantity').value,meals:+document.getElementById('quantity').value,availableQuantity:+document.getElementById('quantity').value,address:document.getElementById('address').value,latitude:31.254+(Math.random()-.5)*.025,longitude:75.704+(Math.random()-.5)*.025,createdAt:Date.now(),pickupDeadline:Date.now()+mins*60000,claimDeadline:Date.now()+mins*60000,reservationDeadline:Date.now()+mins*60000,status:'active',collectionInstructions:document.getElementById('notes').value,claimedBy:null,originalPrice:op,discountedPrice:dp,discountPercentage:type==='sell'?Math.round((1-dp/op)*100):0,reservedQuantity:0};addListing(l);e.target.reset();choosePostType('donation');showView(type==='sell'?'sell':'donate');showToast('Your listing is now live for nearby people.');}
+async function handlePost(e){e.preventDefault();const type=document.getElementById('listingType').value,mins=+document.getElementById('minutes').value,op=+document.getElementById('originalPrice').value,dp=+document.getElementById('discountedPrice').value;if(type==='sell'&&(!op||!dp||dp>=op)){showToast('Please enter a discounted price lower than the original price.');return}try{const session=await backend.session();if(!session){showView('login');showToast('Please log in before posting a listing.');return}const quantity=+document.getElementById('quantity').value,l={type,ownerId:session.user.id,providerName:document.getElementById('providerName').value,providerType:'Community provider',foodName:document.getElementById('foodName').value,description:document.getElementById('notes').value,foodCategory:document.getElementById('category').value,vegetarian:document.getElementById('vegetarian').checked,quantity,meals:quantity,availableQuantity:quantity,address:document.getElementById('address').value,latitude:31.254+(Math.random()-.5)*.025,longitude:75.704+(Math.random()-.5)*.025,createdAt:Date.now(),pickupDeadline:Date.now()+mins*60000,claimDeadline:Date.now()+mins*60000,reservationDeadline:Date.now()+mins*60000,status:'active',collectionInstructions:document.getElementById('notes').value,claimedBy:null,originalPrice:op,discountedPrice:dp,discountPercentage:type==='sell'?Math.round((1-dp/op)*100):0,reservedQuantity:0};await addListing(l);e.target.reset();choosePostType('donation');showView(type==='sell'?'sell':'donate');showToast('Your listing is now live for nearby people.')}catch(error){setBackendStatus(`Could not publish listing: ${error.message}`,true);showToast('We could not publish that listing. Please try again.')} }
 function showToast(message){const t=document.getElementById('toast');t.textContent=message;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3600)}
 function animateCounters(){document.querySelectorAll('[data-count]').forEach(el=>{const target=+el.dataset.count,start=performance.now(),duration=900;function tick(t){const p=Math.min((t-start)/duration,1);el.textContent=Math.round(target*(1-(1-p)**3)).toLocaleString();if(p<1)requestAnimationFrame(tick)}requestAnimationFrame(tick)})}
 document.getElementById('postForm').addEventListener('submit',handlePost);document.getElementById('modal').addEventListener('click',e=>{if(e.target.id==='modal')closeModal()});
@@ -53,7 +116,9 @@ function routeFromHash(){const route=location.hash.slice(1);const valid=['home',
 window.addEventListener('hashchange',routeFromHash);
 function updateImpact(){const claimed=listings.filter(l=>l.status==='claimed'),reserved=listings.filter(l=>l.status==='reserved'),rescued=claimed.reduce((n,l)=>n+(l.meals||l.quantity||0),0)+reserved.reduce((n,l)=>n+(l.reservedQuantity||1),0),active=getActiveListings().length,totalMeals=18420+rescued,totalFood=7000+rescued*.38,totalPeople=13200+Math.round(rescued*.72);const set=(id,value)=>{const node=document.getElementById(id);if(node)node.textContent=value};set('impactMeals',totalMeals.toLocaleString());set('impactWaste',`${totalFood.toFixed(0)} kg`);set('impactPeople',totalPeople.toLocaleString());set('monthlyMeals',Math.round(totalMeals/12).toLocaleString());set('monthlyFood',`${Math.round(totalFood/12)} kg`);set('monthlyPeople',Math.round(totalPeople/12).toLocaleString());set('liveAvailable',active);set('liveClaims',claimed.length);set('liveReservations',reserved.length);const summary=document.getElementById('impactSummary');if(summary)summary.textContent=rescued?`${rescued} meals and food portions have been rescued through actions in this browser. Your activity is now included in FoodBridge’s collective impact.`:`${active} time-sensitive listings are waiting for a nearby person or organisation to act. Your next claim can become part of FoodBridge’s collective impact.`}
 function switchAuth(mode){document.getElementById('loginForm').classList.toggle('hidden',mode==='signup');document.getElementById('signupForm').classList.toggle('hidden',mode!=='signup')}
-function setDemoUser(name,email){localStorage.setItem('foodbridge-demo-user',JSON.stringify({name,email}));const login=document.getElementById('loginButton');if(login){login.textContent=`Hi, ${name.split(' ')[0]}`;login.onclick=()=>{showView('impact')}}}
-function handleLogin(event){event.preventDefault();const email=document.getElementById('loginEmail').value;setDemoUser(email.split('@')[0],email);showView('impact');showToast('You’re logged in to the FoodBridge demo.')}
-function handleSignup(event){event.preventDefault();const name=document.getElementById('signupName').value.trim();const email=document.getElementById('signupEmail').value;setDemoUser(name,email);showView('impact');showToast(`Welcome to FoodBridge, ${name}!`)}
-loadListings();const savedUser=JSON.parse(localStorage.getItem('foodbridge-demo-user')||'null');if(savedUser)setDemoUser(savedUser.name,savedUser.email);document.getElementById('loginForm').addEventListener('submit',handleLogin);document.getElementById('signupForm').addEventListener('submit',handleSignup);routeFromHash();updateImpact();setInterval(()=>{renderListings();updateImpact()},1000);
+function setDemoUser(name,email){const login=document.getElementById('loginButton');if(login){login.textContent=`Hi, ${name.split(' ')[0]}`;login.onclick=()=>{showView('impact')}}}
+async function refreshSession(){try{const session=await backend.session();if(session)setDemoUser(session.user.user_metadata?.display_name||session.user.email.split('@')[0],session.user.email);else if(backend.configured)setBackendStatus('Connected. Log in to post, claim, or reserve food.')}catch(error){setBackendStatus(`Authentication unavailable: ${error.message}`,true)}}
+async function handleLogin(event){event.preventDefault();try{const email=document.getElementById('loginEmail').value,password=document.getElementById('loginPassword').value,user=await backend.signIn(email,password);setDemoUser(user.user_metadata?.display_name||email.split('@')[0],email);showView('impact');showToast('You’re logged in to FoodBridge.')}catch(error){setBackendStatus(`Login failed: ${error.message}`,true);showToast('Login failed. Check your email and password.')} }
+async function handleSignup(event){event.preventDefault();try{const name=document.getElementById('signupName').value.trim(),email=document.getElementById('signupEmail').value,password=document.getElementById('signupPassword').value,user=await backend.signUp(name,email,password);if(user)setDemoUser(name,email);showView('impact');showToast('Account created. Check your email if confirmation is enabled.')}catch(error){setBackendStatus(`Sign up failed: ${error.message}`,true);showToast('Could not create your account.')} }
+async function initialize(){document.getElementById('postForm').addEventListener('submit',handlePost);document.getElementById('modal').addEventListener('click',e=>{if(e.target.id==='modal')closeModal()});document.getElementById('loginForm').addEventListener('submit',handleLogin);document.getElementById('signupForm').addEventListener('submit',handleSignup);if(!backend.configured)setBackendStatus('Backend unavailable: add Supabase configuration to enable live listings and authentication.',true);await loadListings();await refreshSession();routeFromHash();updateImpact();setInterval(()=>{renderListings();updateImpact()},1000)}
+initialize();
